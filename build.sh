@@ -41,26 +41,43 @@ fi
 export KBUILD_BUILD_USER=vbajs
 export KBUILD_BUILD_HOST=tbyool
 
-CLANG_URL=$(curl -s https://api.github.com/repos/bachnxuan/aosp_clang_mirror/releases/latest | \
-             grep "browser_download_url" | \
-             head -n 1 | \
-             cut -d '"' -f 4)
-
-if [ ! -d "$PWD/clang" ]; then
-	curl -L -O "$CLANG_URL"
-	tar -C clang -xf clang-*.tar.gz
+if [ ! -d "$PWD/gcc32" ] && [ ! -d "$PWD/gcc64" ]; then
+       ASSET_URLS=$(curl -s "https://api.github.com/repos/mvaisakh/gcc-build/releases/latest" | grep "browser_download_url" | cut -d '"' -f 4 | grep -E "eva-gcc-arm.*\.xz")
+       for url in $ASSET_URLS; do
+               curl -L -O "$url"
+       done
+       for file in eva-gcc-arm*.xz; do
+               #The files are actually just plain tarballs named as .xz, do not call xz to decompress
+               if [[ "$file" == *arm64* ]]; then
+                       tar -xf "$file" && mv gcc-arm64 gcc64
+               else
+                       tar -xf "$file" && mv gcc-arm gcc32
+               fi
+       rm -rf "$file"
+       done
 else
-	echo "Local clang dir found, will not download clang and using that instead"
+       echo "Local gcc dirs found, will not download gcc and using those instead"
 fi
 
-export PATH="$PWD/clang/bin/:$PATH"
-export CROSS_COMPILE=aarch64-linux-gnu-
-export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+export GCC64_DIR=$PWD/gcc64
+export GCC32_DIR=$PWD/gcc32
+export KBUILD_COMPILER_STRING="$("$GCC64_DIR/bin/aarch64-elf-gcc" --version | head -n1)"
+export PATH="$GCC64_DIR/bin:$GCC32_DIR/bin:$PATH"
 
-#if [ "$local" = true ]; then
-#	echo -e "\nLocal build, disabling LTO...\n"
-#	patch -p1 < local-build.patch
-#fi
+export ARCH=arm64
+export CROSS_COMPILE="aarch64-elf-"
+export CROSS_COMPILE_COMPAT="arm-eabi-"
+
+export CC="aarch64-elf-gcc"
+export LD="$GCC64_DIR/bin/aarch64-elf-ld"
+export AR="aarch64-elf-gcc-ar"
+export AS="aarch64-elf-as"
+export NM="aarch64-elf-nm"
+export OBJCOPY="aarch64-elf-objcopy"
+export OBJDUMP="aarch64-elf-objdump"
+export LLVM=0
+export LLVM_IAS=0
+
 
 if [ "$clean" = true ]; then
 	rm -rf out
@@ -68,18 +85,8 @@ if [ "$clean" = true ]; then
 fi
 
 echo -e "\nStarting compilation...\n"
-make O=out ARCH=arm64 sweet_defconfig
-make -j$(nproc --all) \
-    O=out \
-    ARCH=arm64 \
-    LLVM=1 \
-    LLVM_IAS=1 \
-    LD=ld.lld \
-    AR=llvm-ar \
-    NM=llvm-nm \
-    OBJCOPY=llvm-objcopy \
-    OBJDUMP=llvm-objdump \
-    STRIP=llvm-strip
+make O=out sweet_defconfig
+make -j$(nproc --all) O=out
 
 kernel="out/arch/arm64/boot/Image.gz"
 dtbo="out/arch/arm64/boot/dtbo.img"
@@ -132,18 +139,8 @@ cp $kernel out/arch/arm64/boot/ksu/Image.gz
 ksuboot="out/arch/arm64/boot/ksu/Image.gz"
 rm -rf $kernel
 patch -p1 < disable_ksu.patch
-make O=out ARCH=arm64 sweet_defconfig
-make -j$(nproc --all) \
-    O=out \
-    ARCH=arm64 \
-    LLVM=1 \
-    LLVM_IAS=1 \
-    LD=ld.lld \
-    AR=llvm-ar \
-    NM=llvm-nm \
-    OBJCOPY=llvm-objcopy \
-    OBJDUMP=llvm-objdump \
-    STRIP=llvm-strip
+make O=out sweet_defconfig
+make -j$(nproc --all) O=out
 
 if [ ! -f "$kernel" ]; then
 	echo -e "\nCompilation failed!"
