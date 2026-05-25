@@ -24,30 +24,7 @@
 #include <linux/uaccess.h>
 
 #ifdef CONFIG_NOMOUNT
-extern void nomount_vfs_inject_dir(struct file *file, struct dir_context *ctx);
-extern bool nomount_should_skip(void);
-extern const loff_t nomount_magic_pos;
-
-#define nomount_handle_iterate_dir(file, ctx, shared, res)               \
-do {                                                                     \
-    loff_t _old_pos = (ctx)->pos;                                        \
-    bool _nm_skip = nomount_should_skip();                               \
-                                                                         \
-    if ((ctx)->pos >= nomount_magic_pos && !_nm_skip) {                  \
-        (res) = 0;                                                       \
-    } else {                                                             \
-        if (shared)                                                      \
-            (res) = (file)->f_op->iterate_shared((file), (ctx));         \
-        else                                                             \
-            (res) = (file)->f_op->iterate((file), (ctx));                \
-    }                                                                    \
-                                                                         \
-    if ((res) >= 0 && !_nm_skip) {                                       \
-        if ((ctx)->pos == _old_pos || (ctx)->pos >= nomount_magic_pos) { \
-            nomount_vfs_inject_dir((file), (ctx));                       \
-        }                                                                \
-    }                                                                    \
-} while (0)
+extern int nomount_handle_iterate_dir(struct file *file, struct dir_context *ctx);
 #endif
 
 #ifdef CONFIG_KSU_SUSFS_SUS_PATH
@@ -80,7 +57,7 @@ int iterate_dir(struct file *file, struct dir_context *ctx)
 	if (!IS_DEADDIR(inode)) {
 		ctx->pos = file->f_pos;
 #ifdef CONFIG_NOMOUNT
-		nomount_handle_iterate_dir(file, ctx, shared, res);
+		res = nomount_handle_iterate_dir(file, ctx);
 #else
 		if (shared)
 			res = file->f_op->iterate_shared(file, ctx);

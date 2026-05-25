@@ -5,21 +5,20 @@
 #include <linux/list.h>
 #include <linux/hashtable.h>
 #include <linux/atomic.h>
-#include <linux/ioctl.h>
-#include <linux/rwsem.h>
+#include <net/sock.h>
+#include <net/genetlink.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#include <linux/unaligned.h>
+#else
+#include <asm/unaligned.h>
+#endif
+#include <linux/jump_label.h>
 
-#define NOMOUNT_MAGIC_CODE 0x4E /* 'N' */
 #define NOMOUNT_VERSION    2
 #define NOMOUNT_HASH_BITS  12
 #define NOMOUNT_UID_HASH_BITS 4
-#define NM_FLAG_IS_DIR        (1 << 7)
-#define NOMOUNT_IOC_ADD_RULE    _IOW(NOMOUNT_MAGIC_CODE, 1, struct nomount_ioctl_data)
-#define NOMOUNT_IOC_DEL_RULE    _IOW(NOMOUNT_MAGIC_CODE, 2, struct nomount_ioctl_data)
-#define NOMOUNT_IOC_CLEAR_ALL   _IO(NOMOUNT_MAGIC_CODE,  3)
-#define NOMOUNT_IOC_GET_VERSION _IOR(NOMOUNT_MAGIC_CODE, 4, int)
-#define NOMOUNT_IOC_ADD_UID     _IOW(NOMOUNT_MAGIC_CODE, 5, unsigned int)
-#define NOMOUNT_IOC_DEL_UID     _IOW(NOMOUNT_MAGIC_CODE, 6, unsigned int)
-#define NOMOUNT_IOC_GET_LIST    _IOR(NOMOUNT_MAGIC_CODE, 7, int)
+#define NM_FLAG_IS_DIR (1 << 1)
 
 static DEFINE_HASHTABLE(nomount_dirs_ht,           NOMOUNT_HASH_BITS);
 static DEFINE_HASHTABLE(nomount_rules_by_vpath,    NOMOUNT_HASH_BITS);
@@ -30,53 +29,54 @@ static DEFINE_HASHTABLE(nomount_uid_ht,            NOMOUNT_UID_HASH_BITS);
 static LIST_HEAD(nomount_rules_list);
 static LIST_HEAD(nomount_private_dirs_list);
 static DEFINE_MUTEX(nomount_write_mutex);
-static DECLARE_RWSEM(nomount_dirs_rwsem);
-
-struct nomount_ioctl_data {
-    u64 virtual_path;
-    u64 real_path;
-    u32 flags;
-};
 
 struct nomount_rule {
+    struct list_head list;
     struct hlist_node v_ino_node;
     struct hlist_node real_ino_node;
     struct hlist_node vpath_node;
     struct hlist_node basename_node;
-    struct list_head list;
     char *virtual_path;
     char *real_path;
     const char *basename;
     unsigned long v_ino;
     unsigned long real_ino;
-    long v_fs_type;
+    unsigned long parent_ino;
+    u32 v_fs_type;
+    u32 v_hash;
+    u32 b_hash;
     dev_t v_dev;
     dev_t real_dev;
-    u32 v_hash;
-    u32 flags;
+    dev_t parent_dev;
     u16 vp_len;
     u16 rp_len;
     u16 b_len;
-};
-
-struct nomount_dir_node {
-    struct hlist_node node;      
-    struct list_head private_list;
-    struct list_head children_names; 
-    char *dir_path;              
-    unsigned long dir_ino;
-    u32 next_child_index;
-    u16 dir_path_len;
-    bool is_private;
+    u8  flags;
 };
 
 struct nomount_child_name {
-    struct list_head list;
     unsigned long fake_ino;
-    u32 v_index;
     u16 name_len;
     u8 d_type;
-    char name[]; /* Flexible array: must be the last member! */
+    char name[256];
+};
+
+struct nm_child_array {
+    atomic_t refcnt;
+    u32 num_children;
+    struct rcu_head rcu;
+    struct nomount_child_name entries[]; /* Flexible array member */
+};
+
+struct nomount_dir_node {
+    struct hlist_node node;
+    struct list_head private_list;
+    struct nm_child_array __rcu *child_array; 
+    char *dir_path;
+    unsigned long dir_ino;
+    dev_t dir_dev;
+    u16 dir_path_len;
+    bool is_private;
 };
 
 struct nomount_uid_node {
@@ -84,30 +84,62 @@ struct nomount_uid_node {
     uid_t uid;
 };
 
-/*
- * Recursion tracking for nomount operations. 
- * We use a lockless, fixed-size array of atomic counters.
- * To minimize collisions in heavily threaded environments,
- * we hash the memory address of the task_struct (current) instead of the PID.
+/* VFS Hook Prototypes */
+char *nomount_handle_dpath(const struct path *path, char *buf, int buflen);
+int nomount_handle_permission(struct inode *inode, int mask);
+struct filename *nomount_handle_getname(struct filename *name);
+int nomount_handle_iterate_dir(struct file *file, struct dir_context *ctx);
+int nomount_handle_getattr(int ret, const struct path *path, struct kstat *stat);
+void nomount_spoof_statfs(const struct path *path, struct kstatfs *buf);
+bool nomount_spoof_mmap_metadata(struct inode *inode, dev_t *dev, unsigned long *ino);
+
+/* ========================================================================= */
+/* NETLINK GENERIC PROTOCOL DEFINITIONS */
+/* ========================================================================= */
+
+#define NOMOUNT_GENL_NAME "nomount"
+#define NOMOUNT_GENL_VERSION 1
+
+/* Commands */
+enum {
+    NOMOUNT_CMD_UNSPEC = 0,
+    NOMOUNT_CMD_GET_VERSION,
+    NOMOUNT_CMD_ADD_RULE,
+    NOMOUNT_CMD_DEL_RULE,
+    NOMOUNT_CMD_CLEAR_ALL,
+    NOMOUNT_CMD_ADD_UID,
+    NOMOUNT_CMD_DEL_UID,
+    NOMOUNT_CMD_GET_LIST,
+    __NOMOUNT_CMD_MAX,
+};
+#define NOMOUNT_CMD_MAX (__NOMOUNT_CMD_MAX - 1)
+
+/* Attributes */
+enum {
+    NOMOUNT_ATTR_UNSPEC = 0,
+    NOMOUNT_ATTR_VIRTUAL_PATH,  /* String (NLA_NUL_STRING) */
+    NOMOUNT_ATTR_REAL_PATH,     /* String (NLA_NUL_STRING) */
+    NOMOUNT_ATTR_FLAGS,         /* u32 (NLA_U32) */
+    NOMOUNT_ATTR_UID,           /* u32 (NLA_U32) */
+    NOMOUNT_ATTR_VERSION,       /* u32 (NLA_U32) */
+    NOMOUNT_ATTR_PAYLOAD,       /* Binary payload for GET_LIST (NLA_BINARY) */
+    __NOMOUNT_ATTR_MAX,
+};
+
+#define NOMOUNT_ATTR_MAX (__NOMOUNT_ATTR_MAX - 1)
+
+/* * Compat macros for Generic Netlink Policy API changes.
+ * Linux 4.20 moved the policy pointer from genl_ops to genl_family.
  */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 2, 0)
+#define NM_OPS_POLICY(p)    .policy = (p),
+#define NM_FAMILY_POLICY(p)
+#else
+#define NM_OPS_POLICY(p)
+#define NM_FAMILY_POLICY(p) .policy = (p),
+#endif
 
-#define NM_RECURSION_BINS 4096
-static atomic_t nm_rec_counters[NM_RECURSION_BINS];
-
-static inline int nm_get_bin(void) {
-    return (hash_ptr(current, ilog2(NM_RECURSION_BINS))) & (NM_RECURSION_BINS - 1);
-}
-
-static inline void nm_enter(void) {
-    atomic_inc(&nm_rec_counters[nm_get_bin()]);
-}
-
-static inline void nm_exit(void) {
-    atomic_dec(&nm_rec_counters[nm_get_bin()]);
-}
-
-static inline bool nm_is_recursive(void) {
-    return atomic_read(&nm_rec_counters[nm_get_bin()]) > 5; // Threshold to detect recursion, can be tuned
-}
+/* Application UID start */
+#define AID_APP_START 10000
 
 #endif /* _LINUX_NOMOUNT_H */
